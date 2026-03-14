@@ -12,16 +12,16 @@ const http = require('http');
 
 const PORT       = process.env.PORT || 3000;
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-const MODEL_ID   = 'amazon.nova-sonic-v1:0';
+const MODEL_ID   = 'amazon.nova-2-sonic-v1:0';
 
 const VOICE_MAP = {
-  'Warm & Friendly':  'Ruth',
-  'Professional':     'Matthew',
-  'Playful':          'Joanna',
-  'Calm & Gentle':    'Salli',
-  'Bold & Confident': 'Stephen',
-  'Youthful':         'Kendra',
-  'default':          'Ruth',
+  'Warm & Friendly':  'tiffany',
+  'Professional':     'matthew',
+  'Playful':          'joanna',
+  'Calm & Gentle':    'salli',
+  'Bold & Confident': 'stephen',
+  'Youthful':         'kendra',
+  'default':          'tiffany',
 };
 
 const bedrock = new BedrockRuntimeClient({
