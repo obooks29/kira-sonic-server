@@ -1,20 +1,18 @@
 ﻿/**
- * Kira Nova Sonic Proxy Server v9
- * Based on exact AWS official Node.js sample with 30ms delays between events
- * Audio input sent BEFORE system prompt (official order)
+ * Kira Nova Sonic Proxy Server v10
+ * Uses ConverseStreamCommand â€” simpler API, confirmed working for textâ†’audio
  */
-const { BedrockRuntimeClient, InvokeModelWithBidirectionalStreamCommand } = require("@aws-sdk/client-bedrock-runtime");
+const { BedrockRuntimeClient, ConverseStreamCommand } = require("@aws-sdk/client-bedrock-runtime");
 const WebSocket = require("ws");
 const http = require("http");
-const { v4: uuidv4 } = require("uuid");
 
 const PORT     = process.env.PORT || 3000;
 const MODEL_ID = "amazon.nova-2-sonic-v1:0";
 
 const VOICE_MAP = {
-  "Warm & Friendly": "tiffany", "Professional": "matthew",
-  "Playful": "tiffany", "Calm & Gentle": "tiffany",
-  "Bold & Confident": "matthew", "Youthful": "tiffany", "default": "tiffany",
+  "Warm & Friendly": "matthew", "Professional": "matthew",
+  "Playful": "matthew", "Calm & Gentle": "matthew",
+  "Bold & Confident": "matthew", "Youthful": "matthew", "default": "matthew",
 };
 
 const bedrock = new BedrockRuntimeClient({
@@ -24,11 +22,6 @@ const bedrock = new BedrockRuntimeClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
-
-// 32ms of silent PCM at 16kHz 16-bit mono = 1024 bytes
-const SILENT = Buffer.alloc(1024, 0).toString("base64");
-
-const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
 function buildWav(pcm, sr = 24000) {
   const h = Buffer.alloc(44);
@@ -46,100 +39,57 @@ function safeSend(ws, data) {
 
 async function handleSpeak(ws, { text, personality = "default", requestId }) {
   if (!text?.trim()) return;
-  const voiceId = VOICE_MAP[personality] || "tiffany";
-  const pn = uuidv4();
-  const sysId   = uuidv4();
-  const audioId = uuidv4();
-  const textId  = uuidv4();
+  const voiceId = VOICE_MAP[personality] || "matthew";
   const pcm = [];
 
-  console.log(`[Sonic v9] "${text.slice(0,60)}" voice=${voiceId}`);
+  console.log(`[Sonic v10] "${text.slice(0,60)}" voice=${voiceId}`);
   safeSend(ws, { type: "start", requestId });
 
   try {
-    // Build all events upfront with delays between them
-    // Official AWS pattern: 30ms delay between each event
-    async function* stream() {
-      const events = [
-        // 1. Session start
-        { event: { sessionStart: { inferenceConfiguration: { maxTokens: 1024, topP: 0.9, temperature: 0.7 }}}},
-        // 2. Prompt start
-        { event: { promptStart: { promptName: pn,
-          textOutputConfiguration: { mediaType: "text/plain" },
-          audioOutputConfiguration: { mediaType: "audio/lpcm", sampleRateHertz: 24000,
-            sampleSizeBits: 16, channelCount: 1, voiceId, encoding: "base64", audioType: "SPEECH" },
-        }}},
-        // 3. System content start
-        { event: { contentStart: { promptName: pn, contentName: sysId,
-          type: "TEXT", interactive: false, role: "SYSTEM",
-          textInputConfiguration: { mediaType: "text/plain" },
-        }}},
-        // 4. System text
-        { event: { textInput: { promptName: pn, contentName: sysId,
-          content: "You are a TTS system. Speak the user text verbatim as audio. Do not respond or add anything extra.",
-        }}},
-        // 5. System content end
-        { event: { contentEnd: { promptName: pn, contentName: sysId }}},
-        // 6. Audio content start (required â€” silent input)
-        { event: { contentStart: { promptName: pn, contentName: audioId,
-          type: "AUDIO", interactive: false, role: "USER",
-          audioInputConfiguration: { mediaType: "audio/lpcm", sampleRateHertz: 16000,
-            sampleSizeBits: 16, channelCount: 1, audioType: "SPEECH", encoding: "base64" },
-        }}},
-      ];
+    const command = new ConverseStreamCommand({
+      modelId: MODEL_ID,
+      system: [{ text: "You are Bunnie, a warm AI companion for deaf and mute users. Speak naturally and clearly." }],
+      messages: [{ role: "user", content: [{ text }] }],
+      inferenceConfig: { maxTokens: 1024, temperature: 0.7, topP: 0.9 },
+      additionalModelRequestFields: {
+        audioOutputConfiguration: {
+          mediaType: "audio/lpcm",
+          sampleRateHertz: 24000,
+          sampleSizeBits: 16,
+          channelCount: 1,
+          voiceId,
+          encoding: "base64",
+          audioType: "SPEECH",
+        },
+      },
+    });
 
-      for (const ev of events) {
-        const json = JSON.stringify(ev);
-        console.log(`Sending: ${json.substring(0, 60)}...`);
-        yield { chunk: { bytes: Buffer.from(json) }};
-        await delay(30); // Official AWS delay between events
+    const response = await bedrock.send(command);
+
+    for await (const event of response.stream) {
+      const keys = Object.keys(event);
+      if (keys.length) console.log("[Sonic] Event:", keys[0]);
+
+      // Audio output
+      if (event.audioOutput?.content) {
+        pcm.push(Buffer.from(event.audioOutput.content, "base64"));
+        console.log(`[Sonic] PCM chunk ${pcm.length}`);
       }
-
-      // Send silent audio frames
-      for (let i = 0; i < 5; i++) {
-        yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { audioInput: { promptName: pn, contentName: audioId, content: SILENT }}})) }};
-        await delay(30);
+      // Content block delta (may contain audio)
+      if (event.contentBlockDelta?.delta?.audio) {
+        pcm.push(Buffer.from(event.contentBlockDelta.delta.audio, "base64"));
+        console.log(`[Sonic] Audio delta chunk ${pcm.length}`);
       }
-
-      // Close audio
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { contentEnd: { promptName: pn, contentName: audioId }}})) }};
-      await delay(30);
-
-      // Text to speak
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { contentStart: { promptName: pn, contentName: textId, type: "TEXT", interactive: false, role: "USER", textInputConfiguration: { mediaType: "text/plain" }}}})) }};
-      await delay(30);
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { textInput: { promptName: pn, contentName: textId, content: text }}})) }};
-      await delay(30);
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { contentEnd: { promptName: pn, contentName: textId }}})) }};
-      await delay(30);
-
-      // End session
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { promptEnd: { promptName: pn }}})) }};
-      await delay(30);
-      yield { chunk: { bytes: Buffer.from(JSON.stringify({ event: { sessionEnd: {} }})) }};
-    }
-
-    const response = await bedrock.send(
-      new InvokeModelWithBidirectionalStreamCommand({ modelId: MODEL_ID, body: stream() })
-    );
-
-    for await (const chunk of response.body) {
-      if (chunk.internalServerException)   { console.error("[Sonic]", chunk.internalServerException.message); break; }
-      if (chunk.modelStreamErrorException) { console.error("[Sonic]", chunk.modelStreamErrorException.message); break; }
-      if (!chunk.chunk?.bytes) continue;
-      try {
-        const parsed = JSON.parse(Buffer.from(chunk.chunk.bytes).toString("utf-8"));
-        const ev = parsed.event || {};
-        const keys = Object.keys(ev);
-        if (keys.length) console.log("[Sonic] Event:", keys[0]);
-        if (ev.audioOutput?.content) {
-          pcm.push(Buffer.from(ev.audioOutput.content, "base64"));
-          console.log(`[Sonic] PCM chunk ${pcm.length}: ${ev.audioOutput.content.length} chars`);
-        }
-      } catch { console.log("[Sonic] Binary chunk:", chunk.chunk.bytes.length, "bytes"); }
+      if (event.contentBlockDelta?.delta?.text) {
+        console.log("[Sonic] Text:", event.contentBlockDelta.delta.text.slice(0,50));
+      }
+      if (event.metadata) {
+        console.log("[Sonic] Usage:", JSON.stringify(event.metadata.usage));
+      }
     }
 
     if (pcm.length === 0) {
+      console.log("[Sonic] No audio received");
       safeSend(ws, { type: "error", message: "No audio generated", requestId });
       return;
     }
@@ -157,7 +107,7 @@ async function handleSpeak(ws, { text, personality = "default", requestId }) {
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: "v9", model: MODEL_ID }));
+  res.end(JSON.stringify({ status: "ok", version: "v10", model: MODEL_ID }));
 });
 
 const wss = new WebSocket.Server({ server });
@@ -173,5 +123,5 @@ wss.on("connection", ws => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Kira Nova Sonic v9 on port ${PORT}`);
+  console.log(`Kira Nova Sonic v10 on port ${PORT}`);
 });
