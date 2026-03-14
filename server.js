@@ -1,7 +1,6 @@
 /**
- * Kira — Nova Sonic Proxy Server v5
- * Based on AWS official "nova-sonic-speaks-first" pattern
- * Text-only input, audio output — no silent audio frames needed
+ * Kira — Nova Sonic Proxy Server v6
+ * Fixed: consistent content IDs across start/input/end events
  */
 
 const { BedrockRuntimeClient, InvokeModelWithBidirectionalStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -31,7 +30,6 @@ const bedrock = new BedrockRuntimeClient({
   },
 });
 
-// ── WAV builder ───────────────────────────────────────────────────────────────
 function buildWav(pcm, sr = 24000) {
   const hdr = Buffer.alloc(44);
   hdr.write('RIFF',0); hdr.writeUInt32LE(36+pcm.length,4); hdr.write('WAVE',8);
@@ -42,125 +40,104 @@ function buildWav(pcm, sr = 24000) {
   return Buffer.concat([hdr, pcm]);
 }
 
+function ev(obj) {
+  return { chunk: { bytes: Buffer.from(JSON.stringify(obj)) }};
+}
+
 function safeSend(ws, data) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
-// ── Handle speak ──────────────────────────────────────────────────────────────
 async function handleSpeak(clientWs, { text, personality = 'default', requestId }) {
   if (!text?.trim()) return;
 
-  const voiceId    = VOICE_MAP[personality] || 'tiffany';
-  const promptName = uuidv4();
-  const contentName = uuidv4();
-  const pcmChunks  = [];
+  const voiceId     = VOICE_MAP[personality] || 'tiffany';
+  const promptName  = uuidv4();
+  const sysContent  = uuidv4();  // ONE id used for start + input + end
+  const userContent = uuidv4();  // ONE id used for start + input + end
+  const pcmChunks   = [];
 
   console.log(`[Sonic] "${text.slice(0,60)}" | voice=${voiceId}`);
   safeSend(clientWs, { type: 'start', requestId });
 
   try {
-    // ── Build event stream ────────────────────────────────────────────────────
-    // Based on AWS nova-sonic-speaks-first official pattern
-    const events = [
-      // 1. Session config
-      { event: { sessionStart: {
+    async function* stream() {
+      // 1. Session start
+      yield ev({ event: { sessionStart: {
         inferenceConfiguration: { maxTokens: 1024, topP: 0.95, temperature: 0.9 }
-      }}},
+      }}});
 
-      // 2. Prompt config with audio output
-      { event: { promptStart: {
+      // 2. Prompt start
+      yield ev({ event: { promptStart: {
         promptName,
         textOutputConfiguration:  { mediaType: 'text/plain' },
         audioOutputConfiguration: {
-          mediaType:       'audio/lpcm',
-          sampleRateHertz: 24000,
-          sampleSizeBits:  16,
-          channelCount:    1,
-          voiceId,
-          encoding:        'base64',
-          audioType:       'SPEECH',
+          mediaType: 'audio/lpcm', sampleRateHertz: 24000,
+          sampleSizeBits: 16, channelCount: 1,
+          voiceId, encoding: 'base64', audioType: 'SPEECH',
         },
-      }}},
+      }}});
 
-      // 3. System message
-      { event: { contentStart: {
-        promptName,
-        contentName: uuidv4(),
+      // 3. System content — SAME sysContent id throughout
+      yield ev({ event: { contentStart: {
+        promptName, contentName: sysContent,
         type: 'TEXT', interactive: false, role: 'SYSTEM',
         textInputConfiguration: { mediaType: 'text/plain' },
-      }}},
-      { event: { textInput: {
-        promptName,
-        contentName: uuidv4(),
-        content: 'You are Bunnie, a helpful AI companion for deaf and mute users. Speak clearly and naturally. Respond directly with what needs to be said — do not add extra commentary.',
-      }}},
-      { event: { contentEnd: { promptName, contentName: uuidv4() }}},
+      }}});
+      yield ev({ event: { textInput: {
+        promptName, contentName: sysContent,
+        content: 'You are Bunnie, a warm AI companion for deaf and mute users. Speak the user text naturally and clearly.',
+      }}});
+      yield ev({ event: { contentEnd: { promptName, contentName: sysContent }}});
 
-      // 4. User text message — what to speak
-      { event: { contentStart: {
-        promptName,
-        contentName,
+      // 4. User content — SAME userContent id throughout
+      yield ev({ event: { contentStart: {
+        promptName, contentName: userContent,
         type: 'TEXT', interactive: true, role: 'USER',
         textInputConfiguration: { mediaType: 'text/plain' },
-      }}},
-      { event: { textInput: { promptName, contentName, content: text }}},
-      { event: { contentEnd: { promptName, contentName }}},
+      }}});
+      yield ev({ event: { textInput: {
+        promptName, contentName: userContent, content: text,
+      }}});
+      yield ev({ event: { contentEnd: { promptName, contentName: userContent }}});
 
       // 5. End
-      { event: { promptEnd: { promptName }}},
-      { event: { sessionEnd: {} }},
-    ];
-
-    // Each event must be { chunk: { bytes: Buffer } }
-    async function* eventStream() {
-      for (const ev of events) {
-        yield { chunk: { bytes: Buffer.from(JSON.stringify(ev)) }};
-      }
+      yield ev({ event: { promptEnd: { promptName }}});
+      yield ev({ event: { sessionEnd: {} }});
     }
 
     const response = await bedrock.send(
-      new InvokeModelWithBidirectionalStreamCommand({ modelId: MODEL_ID, body: eventStream() })
+      new InvokeModelWithBidirectionalStreamCommand({ modelId: MODEL_ID, body: stream() })
     );
 
-    // ── Collect response ──────────────────────────────────────────────────────
     for await (const chunk of response.body) {
-      // Log raw chunk type for debugging
-      if (chunk.internalServerException) {
-        console.error('[Sonic] InternalServerException:', chunk.internalServerException.message);
-        break;
-      }
-      if (chunk.modelStreamErrorException) {
-        console.error('[Sonic] ModelStreamError:', chunk.modelStreamErrorException.message);
-        break;
-      }
+      if (chunk.internalServerException) { console.error('[Sonic]', chunk.internalServerException.message); break; }
+      if (chunk.modelStreamErrorException) { console.error('[Sonic]', chunk.modelStreamErrorException.message); break; }
+
       if (chunk.chunk?.bytes) {
         try {
-          const ev = JSON.parse(Buffer.from(chunk.chunk.bytes).toString('utf-8'));
-          const keys = Object.keys(ev.event || ev || {});
-          console.log('[Sonic] Event keys:', keys);
+          const parsed = JSON.parse(Buffer.from(chunk.chunk.bytes).toString('utf-8'));
+          const eventObj = parsed.event || parsed;
+          console.log('[Sonic] Event:', Object.keys(eventObj).join(','));
 
-          const audio = ev?.event?.audioOutput ?? ev?.audioOutput;
+          const audio = eventObj.audioOutput;
           if (audio?.content) {
             pcmChunks.push(Buffer.from(audio.content, 'base64'));
-            console.log(`[Sonic] PCM chunk: ${audio.content.length} chars`);
+            console.log(`[Sonic] PCM chunk ${pcmChunks.length}: ${audio.content.length} chars`);
           }
-          const txt = ev?.event?.textOutput ?? ev?.textOutput;
-          if (txt?.content) console.log('[Sonic] Text:', txt.content.slice(0,50));
-
-        } catch (e) {
-          console.log('[Sonic] Non-JSON chunk, length:', chunk.chunk.bytes.length);
+        } catch {
+          console.log('[Sonic] Binary chunk:', chunk.chunk.bytes.length, 'bytes');
         }
       }
     }
 
     if (pcmChunks.length === 0) {
-      console.log('[Sonic] No PCM chunks received');
       safeSend(clientWs, { type: 'error', message: 'No audio generated', requestId });
       return;
     }
 
     const wav = buildWav(Buffer.concat(pcmChunks));
-    console.log(`[Sonic] ✅ WAV: ${(wav.length/1024).toFixed(1)}KB from ${pcmChunks.length} chunks`);
+    console.log(`[Sonic] ✅ ${(wav.length/1024).toFixed(1)}KB WAV`);
     safeSend(clientWs, { type: 'wav_audio', audio: wav.toString('base64'), sampleRate: 24000, requestId });
     safeSend(clientWs, { type: 'done', requestId, chunks: pcmChunks.length });
 
@@ -170,7 +147,6 @@ async function handleSpeak(clientWs, { text, personality = 'default', requestId 
   }
 }
 
-// ── HTTP + WebSocket on same port ─────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ status: 'ok', service: 'kira-sonic', model: MODEL_ID }));
@@ -189,6 +165,6 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🐰 Kira Nova Sonic v5 on port ${PORT}`);
-  console.log(`🏥 ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:'+PORT}`);
+  console.log(`🐰 Kira Nova Sonic v6 on port ${PORT}`);
+  console.log(`🏥 https://kira-sonic-server.onrender.com`);
 });
