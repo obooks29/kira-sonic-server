@@ -135,10 +135,23 @@ async function handleSpeak(clientWs, { text, personality = 'default', requestId 
       if (!chunk.chunk?.bytes) continue;
       try {
         const ev = JSON.parse(Buffer.from(chunk.chunk.bytes).toString('utf-8'));
+        // Log every event type for debugging
+        const eventKeys = Object.keys(ev.event || {});
+        if (eventKeys.length > 0) console.log('[Sonic] Event:', eventKeys[0]);
+        
         if (ev.event?.audioOutput?.content) {
           pcmChunks.push(Buffer.from(ev.event.audioOutput.content, 'base64'));
+          console.log(`[Sonic] Audio chunk received: ${ev.event.audioOutput.content.length} chars`);
         }
-      } catch {}
+        if (ev.event?.textOutput) {
+          console.log('[Sonic] Text output:', ev.event.textOutput.content?.slice(0, 50));
+        }
+        if (ev.event?.completionOutput) {
+          console.log('[Sonic] Completion:', JSON.stringify(ev.event.completionOutput));
+        }
+      } catch (parseErr) {
+        console.log('[Sonic] Raw chunk (non-JSON):', chunk.chunk.bytes.length, 'bytes');
+      }
     }
 
     if (pcmChunks.length === 0) {
