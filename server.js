@@ -163,7 +163,11 @@ async function handleSpeak(clientWs, { text, personality = 'default', requestId 
   }
 }
 
-function encode(obj) { return Buffer.from(JSON.stringify(obj), 'utf-8'); }
+// AWS SDK expects { chunk: { bytes: Buffer } } format for bidirectional stream
+function encode(obj) {
+  const bytes = Buffer.from(JSON.stringify(obj), 'utf-8');
+  return { chunk: { bytes } };
+}
 function safeSend(ws, data) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
