@@ -15,13 +15,13 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const MODEL_ID   = 'amazon.nova-sonic-v1:0';
 
 const VOICE_MAP = {
-  'Warm & Friendly':  'ruth',
-  'Professional':     'matthew',
-  'Playful':          'joanna',
-  'Calm & Gentle':    'salli',
-  'Bold & Confident': 'stephen',
-  'Youthful':         'kendra',
-  'default':          'ruth',
+  'Warm & Friendly':  'Ruth',
+  'Professional':     'Matthew',
+  'Playful':          'Joanna',
+  'Calm & Gentle':    'Salli',
+  'Bold & Confident': 'Stephen',
+  'Youthful':         'Kendra',
+  'default':          'Ruth',
 };
 
 const bedrock = new BedrockRuntimeClient({
