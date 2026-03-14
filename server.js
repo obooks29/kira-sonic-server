@@ -67,23 +67,7 @@ function buildWavBuffer(pcmBuffer, sampleRate = 24000, channels = 1, bitsPerSamp
 }
 
 // ── WebSocket server ──────────────────────────────────────────────────────────
-const wss = new WebSocket.Server({ port: PORT });
-console.log(`🐰 Kira Nova Sonic server on port ${PORT}`);
-
-wss.on('connection', (clientWs) => {
-  console.log('[Server] Client connected');
-
-  clientWs.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.type === 'speak')  await handleSpeak(clientWs, msg);
-    if (msg.type === 'ping')   safeSend(clientWs, { type: 'pong' });
-  });
-
-  clientWs.on('close', () => console.log('[Server] Client disconnected'));
-  clientWs.on('error', (e)  => console.error('[Server] Error:', e.message));
-});
+// WebSocket attached to HTTP server below
 
 // ── Handle speak ──────────────────────────────────────────────────────────────
 async function handleSpeak(clientWs, { text, personality = 'default', requestId }) {
@@ -184,8 +168,28 @@ function safeSend(ws, data) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
-// Health check
-http.createServer((req, res) => {
+// ── HTTP server — handles both health checks AND WebSocket upgrades ───────────
+const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', service: 'kira-sonic', model: MODEL_ID }));
-}).listen(PORT + 1, () => console.log(`🏥 Health: http://localhost:${PORT + 1}`));
+  res.end(JSON.stringify({ status: 'ok', service: 'kira-sonic', model: MODEL_ID, port: PORT }));
+});
+
+// Attach WebSocket server to HTTP server (same port)
+const wssAttached = new WebSocket.Server({ server });
+
+wssAttached.on('connection', (clientWs) => {
+  console.log('[Server] Client connected');
+  clientWs.on('message', async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (msg.type === 'speak') await handleSpeak(clientWs, msg);
+    if (msg.type === 'ping')  safeSend(clientWs, { type: 'pong' });
+  });
+  clientWs.on('close', () => console.log('[Server] Client disconnected'));
+  clientWs.on('error', (e)  => console.error('[Server] Error:', e.message));
+});
+
+server.listen(PORT, () => {
+  console.log(`🐰 Kira Nova Sonic server on port ${PORT}`);
+  console.log(`🏥 Health check: https://kira-sonic-server.onrender.com`);
+});
